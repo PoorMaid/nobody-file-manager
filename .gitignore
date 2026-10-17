@@ -1,0 +1,6 @@
+*.log
+__pycache__/
+*.pyc
+.backup/
+clip/
+server.log
