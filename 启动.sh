@@ -374,6 +374,44 @@ PYEOF
   echo "$PORT" > "$PORTF"
   echo "$URL" > "$LOGDIR/url.txt"
   echo ""
+  echo "  · 提权后端 Privilege backend"
+  if [ "$(id -u 2>/dev/null)" = "0" ]; then
+    echo "        身份：root（文件与终端均以 uid=0 执行）"
+  else
+    PQ="$LOGDIR/priv"
+    PPIDF="$PQ/privd.pid"
+    PD="-"
+    if [ -f "$PPIDF" ]; then
+      _pd=$(cat "$PPIDF" 2>/dev/null | tr -d ' \r\n')
+      [ -n "$_pd" ] && [ -d "/proc/$_pd" ] && PD="$_pd"
+    fi
+    if [ "$PD" = "-" ]; then
+      echo "        正在自动检测提权通道 su / rish / adb ......"
+      if [ -f "$DIR/app/privboot.sh" ]; then
+        sh "$DIR/app/privboot.sh" "$DIR" 2>&1 | sed 's/^/        /'
+      fi
+      PD="-"
+      if [ -f "$PPIDF" ]; then
+        _pd=$(cat "$PPIDF" 2>/dev/null | tr -d ' \r\n')
+        [ -n "$_pd" ] && [ -d "/proc/$_pd" ] && PD="$_pd"
+      fi
+    fi
+    if [ "$PD" = "-" ]; then
+      echo "        身份：普通权限（文件管理器与终端照常可用）"
+      echo "        提权方法：开启 Shizuku 后重跑本脚本，或手动执行"
+      echo "                  sh '$DIR/app/privboot.sh' '$DIR'"
+    else
+      _pu=$(awk '/^Uid:/{print $2}' "/proc/$PD/status" 2>/dev/null)
+      if [ "$_pu" = "2000" ]; then
+        echo "        身份：Shizuku/ADB shell（privd 在线 pid=$PD uid=2000）"
+      elif [ "$_pu" = "0" ]; then
+        echo "        身份：root（privd 在线 pid=$PD uid=0）"
+      else
+        echo "        身份：受限（privd 在线 pid=$PD uid=$_pu）"
+      fi
+    fi
+  fi
+  echo ""
   echo "=============================================="
   echo "  ✅ 启动成功 Startup successful"
   echo "=============================================="
