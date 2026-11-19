@@ -299,12 +299,18 @@ do_start() {
       if "$s" -c "id" >/dev/null 2>&1; then SU_BIN="$s"; break; fi
     fi
   done
+  AM_BIN=""
+  for a in /system/bin/am /system/xbin/am /apex/com.android.shell/bin/am; do
+    if [ -x "$a" ]; then AM_BIN="$a"; break; fi
+  done
   if [ -n "$SU_BIN" ]; then
     echo "        Root：已获取 ($SU_BIN)，后端以 root 运行"
-    SHHTML_PORT="$PORT" SHHTML_ROOT="${SHHTML_ROOT:-/}" nohup "$SU_BIN" -c "SHHTML_PORT=$PORT SHHTML_ROOT=${SHHTML_ROOT:-/} \"$PY\" \"$APP\"" >"$LOG" 2>&1 &
+    [ -n "$AM_BIN" ] && echo "        AM  ：$AM_BIN（可唤起系统目录选择器）"
+    SHHTML_PORT="$PORT" SHHTML_ROOT="${SHHTML_ROOT:-/}" SHHTML_AM_CMD="${SHHTML_AM_CMD:-$AM_BIN}" nohup "$SU_BIN" -c "SHHTML_PORT=$PORT SHHTML_ROOT=${SHHTML_ROOT:-/} SHHTML_AM_CMD=${SHHTML_AM_CMD:-$AM_BIN} \"$PY\" \"$APP\"" >"$LOG" 2>&1 &
   else
     echo "        Root：未获取，后端以当前用户运行（根目录受限）"
-    SHHTML_PORT="$PORT" nohup "$PY" "$APP" >"$LOG" 2>&1 &
+    [ -n "$AM_BIN" ] && echo "        AM  ：$AM_BIN"
+    SHHTML_PORT="$PORT" SHHTML_AM_CMD="${SHHTML_AM_CMD:-$AM_BIN}" nohup "$PY" "$APP" >"$LOG" 2>&1 &
   fi
   SRVPID=$!
   echo "$SRVPID" > "$PIDF"
