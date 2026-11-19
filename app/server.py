@@ -30,7 +30,55 @@ def _cur_uid():
         except Exception:
             return -1
 
+_FULL_ROOTS = ["/", "/storage", "/data", "/system", "/sdcard"]
+
+def _probe_priv():
+    try:
+        names = os.listdir("/data/data")
+    except Exception:
+        return False
+    readable_uids = set()
+    for n in names:
+        p = "/data/data/" + n
+        try:
+            st = os.stat(p)
+        except Exception:
+            continue
+        try:
+            os.listdir(p)
+        except Exception:
+            continue
+        if st.st_uid != 0:
+            readable_uids.add(st.st_uid)
+    return len(readable_uids) >= 2
+
+def _probe_su():
+    for cmd in ("/system/bin/su", "/system/xbin/su"):
+        try:
+            r = subprocess.run([cmd, "-c", "id"], capture_output=True, timeout=3)
+        except Exception:
+            continue
+        out = (r.stdout or b"") + (r.stderr or b"")
+        if b"uid=0" in out:
+            return True
+    return False
+
+def detect_real_root():
+    if _probe_priv():
+        return True
+    if _probe_su():
+        return True
+    return False
+
+_REAL_ROOT = None
+def real_root():
+    global _REAL_ROOT
+    if _REAL_ROOT is None:
+        _REAL_ROOT = detect_real_root()
+    return _REAL_ROOT
+
 def choose_root():
+
     env = os.environ.get("SHHTML_ROOT")
     if env:
         p = Path(env).expanduser()
@@ -97,6 +145,10 @@ def list_roots():
     seen = []
     out = []
     candidates = [DEFAULT_ROOT] + [str(x) for x in _EXTRA_ROOTS]
+    if real_root():
+        for fr in _FULL_ROOTS:
+            if fr not in candidates:
+                candidates.append(fr)
     for c in candidates:
         if not c or c in seen:
             continue
@@ -113,6 +165,14 @@ def list_roots():
             label = c
         if c == "/sdcard" or c == "/storage/emulated/0":
             label = "内部存储"
+        elif c == "/":
+            label = "根目录 /"
+        elif c == "/storage":
+            label = "存储 /storage"
+        elif c == "/data":
+            label = "数据 /data"
+        elif c == "/system":
+            label = "系统 /system"
         out.append({
             "path": c,
             "label": label,
@@ -130,38 +190,6 @@ def resolve_root(req_root):
         if r["path"] == want:
             return want
     return DEFAULT_ROOT
-
-
-SAF_GRANTS_FILE = APP_ROOT / "logs" / "saf_grants.json"
-
-
-def read_saf_grants():
-    try:
-        raw = SAF_GRANTS_FILE.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-    except Exception:
-        pass
-    return []
-
-
-def open_saf_picker():
-    cmds = [
-        ["am", "start", "-a", "android.intent.action.OPEN_DOCUMENT_TREE"],
-    ]
-    for c in cmds:
-        try:
-            r = subprocess.run(c, capture_output=True, timeout=12)
-            out = (r.stdout or b"").decode("utf-8", "replace")
-            err = (r.stderr or b"").decode("utf-8", "replace")
-            if "Starting:" in out or r.returncode == 0:
-                return True, "已唤起系统目录选择器，请在手机上选择要授权的目录"
-            if "SecurityException" in err or "Permission Denial" in err:
-                return False, "系统拒绝拉起选择器（缺少跨用户权限），请改用“扫描储存空间”"
-        except Exception as e:
-            return False, "唤起失败：%s" % e
-    return False, "系统未响应，请改用“扫描储存空间”"
 
 
 def add_extra_root(path):
@@ -189,24 +217,102 @@ def remove_extra_root(path):
     return False, "不在列表中"
 
 
-def scan_storage_volumes():
-    found = []
-    base = Path("/storage")
+def _probe_dir(p):
     try:
-        entries = list(base.iterdir())
+        fp = Path(p)
+        if not fp.is_dir():
+            return False
+        list(fp.iterdir())
+        return True
     except Exception:
-        return found
-    for e in entries:
-        name = e.name
-        if name in ("emulated", "self", "enc_emulated"):
-            continue
+        return False
+
+def _mount_points():
+    out = []
+    for f in ("/proc/mounts", "/proc/self/mountinfo"):
         try:
-            if not e.is_dir():
-                continue
-            list(e.iterdir())
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if f == "/proc/mounts":
+                        if len(parts) < 2:
+                            continue
+                        src, mnt, fstype = parts[0], parts[1], parts[2] if len(parts) > 2 else ""
+                        opts = parts[3] if len(parts) > 3 else ""
+                        if "ro," in opts or opts.endswith("ro"):
+                            continue
+                        if fstype in ("proc", "sysfs", "cgroup", "cgroup2", "devpts",
+                                      "tmpfs", "devtmpfs", "mqueue", "selinuxfs",
+                                      "debugfs", "tracefs", "bpf", "configfs",
+                                      "functionfs", "overlay", "squashfs", "iso9660"):
+                            continue
+                    else:
+                        if " - " not in line:
+                            continue
+                        head, tail = line.split(" - ", 1)
+                        hp = head.split()
+                        tp = tail.split()
+                        if len(hp) < 5 or len(tp) < 1:
+                            continue
+                        mnt = hp[4].replace("\\040", " ")
+                        fstype = tp[0]
+                        if fstype in ("proc", "sysfs", "cgroup", "cgroup2", "devpts",
+                                      "tmpfs", "devtmpfs", "mqueue", "selinuxfs",
+                                      "debugfs", "tracefs", "bpf", "configfs",
+                                      "functionfs", "overlay", "squashfs", "iso9660"):
+                            continue
+                    out.append(mnt)
         except Exception:
             continue
-        found.append(str(e))
+    return out
+
+_VOL_SKIP = ("emulated", "self", "enc_emulated", "sdcard", "runtime", "media_rw",
+             "installer", "android", "asec", "obb", "secure", "data_mirror")
+
+def scan_storage_volumes():
+    found = []
+    seen = set()
+
+    def add(p):
+        p = str(p).rstrip("/") or "/"
+        if p in seen or p == "/":
+            return
+        if not _probe_dir(p):
+            return
+        seen.add(p)
+        found.append(p)
+
+    for base in ("/storage", "/mnt", "/media", "/run/media", "/sdcard", "/Volumes"):
+        try:
+            for e in Path(base).iterdir():
+                n = e.name
+                if base == "/storage" and n in _VOL_SKIP:
+                    continue
+                if base == "/mnt" and n in ("runtime", "media_rw", "vendor", "asec", "obb", "expand"):
+                    continue
+                add(e)
+            if base in ("/sdcard", "/mnt", ""):
+                add(base)
+        except Exception:
+            continue
+
+    for mp in _mount_points():
+        if mp.startswith(("/proc", "/sys", "/dev", "/vendor", "/system", "/apex", "/data/vendor")):
+            continue
+        add(mp)
+
+    try:
+        home = Path.home()
+        add(home)
+        for e in home.iterdir():
+            if e.is_dir() and not e.name.startswith("."):
+                add(e)
+    except Exception:
+        pass
+
+    for p in ("/sdcard", "/storage/emulated/0", "/tmp"):
+        add(p)
+
     return found
 
 def safe_join(root, rel):
@@ -297,7 +403,8 @@ class Handler(BaseHTTPRequestHandler):
                 "port": PORT,
                 "version": VERSION,
                 "uid": _cur_uid(),
-                "isRoot": _cur_uid() == 0,
+                "isRoot": real_root(),
+                "rootHint": "" if real_root() else "未获得 root，无法全盘访问；仅能访问当前可读目录。需要全盘访问请以 root 运行本服务。",
             })
             return
         if path == "/api/stop_server":
@@ -320,15 +427,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "found": items})
             return
 
-        if path == "/api/saf_picker":
-            opened, msg = open_saf_picker()
-            grants = read_saf_grants()
-            self._send_json({"ok": opened, "message": msg, "grants": grants})
-            return
-
-        if path == "/api/saf_grants":
-            self._send_json({"ok": True, "grants": read_saf_grants()})
-            return
         if path == "/api/roots/add":
             ok, msg = add_extra_root(qs.get("path", [""])[0])
             self._send_json({"ok": ok, "message": msg, "roots": list_roots(), "default": DEFAULT_ROOT})
@@ -448,6 +546,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_error(500, str(e))
             return
+
+        self._send_error(404, "not found")
 
     def do_POST(self):
         parsed = urlparse(self.path)
