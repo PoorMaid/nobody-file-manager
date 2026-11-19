@@ -132,6 +132,17 @@ if still_running; then
 fi
 
 rm -f "$PIDF"
+PPIDF="$DIR/logs/priv/privd.pid"
+if [ -f "$PPIDF" ]; then
+  PPD=$(cat "$PPIDF" 2>/dev/null | tr -d ' \r\n')
+  if [ -n "$PPD" ] && [ -d "/proc/$PPD" ]; then
+    echo "  · 结束提权守护 privd PID：$PPD"
+    kill "$PPD" 2>/dev/null || true
+    sleep 1
+    [ -d "/proc/$PPD" ] && kill -9 "$PPD" 2>/dev/null || true
+  fi
+  rm -f "$PPIDF"
+fi
 echo ""
 echo "=============================================="
 echo "  ✅ 服务已停止 Service stopped"
