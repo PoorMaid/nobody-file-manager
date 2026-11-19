@@ -92,6 +92,19 @@ main{display:grid;grid-template-columns:1fr 340px;gap:12px;padding:12px;align-it
 #clipbar.on{display:flex}
 #clipText{max-width:26vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row.mk{outline:2px solid var(--accent);outline-offset:-2px}
+#rootSel{background:#0f1a2e;border:1px solid var(--line);color:var(--text);border-radius:9px;padding:5px 8px;font:inherit;font-size:12px;max-width:190px}
+.badge.ro{color:#ffd08a;border-color:#7a5520;background:#33240c}
+.badge.rw{color:#8ef0bd;border-color:#1f6b47;background:#0d2b1d}
+#rootPanel{position:fixed;inset:0;background:rgba(4,9,18,.66);display:none;place-items:center;z-index:170;padding:16px}
+#rootPanel.on{display:grid}
+.rp{background:var(--card);border:1px solid var(--line);border-radius:14px;width:100%;max-width:420px;max-height:82vh;overflow:auto}
+.rp h3{margin:0;padding:11px 14px;font-size:13px;border-bottom:1px solid var(--line);background:#1e2c47;display:flex;justify-content:space-between;align-items:center}
+.rp .body{padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.rp .item{display:flex;gap:8px;align-items:center;justify-content:space-between;background:#16223a;border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px}
+.rp .item .p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cfe3ff}
+.rp .foot{display:flex;gap:8px;justify-content:flex-end;padding:10px 14px;border-top:1px solid var(--line)}
+.rp .rowline{display:flex;gap:6px}
+.rp input{flex:1;background:#0f1a2e;border:1px solid var(--line);color:var(--text);border-radius:9px;padding:7px 10px;font:inherit;font-size:12px}
 #actMenu{position:fixed;inset:0;background:rgba(4,9,18,.6);display:none;place-items:center;z-index:160;padding:16px}
 #actMenu.on{display:grid}
 .amm{background:var(--card);border:1px solid var(--line);border-radius:14px;width:100%;max-width:340px;overflow:hidden}
@@ -103,7 +116,7 @@ main{display:grid;grid-template-columns:1fr 340px;gap:12px;padding:12px;align-it
 </head>
 <body>
 <header>
-  <div class="hleft"><h1>📂 Nobody网页文件管理器</h1><span class="badge" id="rootBadge">加载中…</span></div>
+  <div class="hleft"><h1>📂 Nobody网页文件管理器</h1><span class="badge" id="rootBadge">加载中…</span><select id="rootSel" title="切换储存空间"></select><button class="btn tiny" id="btnAddRoot">＋ 添加储存空间</button></div>
   <div class="pathbar" id="pathBar">/</div>
   <div class="hact">
     <button class="btn primary" id="btnCopy">复制地址</button>
@@ -136,6 +149,7 @@ main{display:grid;grid-template-columns:1fr 340px;gap:12px;padding:12px;align-it
         <button class="btn tiny danger" id="selDel">删除</button>
       </div>
       <div class="list" id="fileList"><div class="loading">加载中…</div></div>
+      <div class="tip" id="roTip" style="display:none;color:#ffd08a">⚠ 当前储存空间为只读：可浏览与下载，不能新建/上传/改名/删除/解压/打包</div>
       <div class="tip">单击目录进入 · 点文本文件编辑 · 点压缩包解压 · 长按/右键更多操作 · 多选后可批量操作</div>
     </section>
     <section class="card" id="termCard">
@@ -160,6 +174,21 @@ main{display:grid;grid-template-columns:1fr 340px;gap:12px;padding:12px;align-it
   </div>
 </div></div>
 <div id="actMenu"><div class="amm"><h3 id="amTitle">-</h3><div id="amBody"></div></div></div>
+<div id="rootPanel"><div class="rp">
+  <h3><span>储存空间管理</span><span class="badge" id="rpStatus">就绪</span></h3>
+  <div class="body">
+    <div id="rpList"></div>
+    <div class="rowline">
+      <input id="rpPath" placeholder="手动输入路径，如 /storage/95F0-2363"/>
+      <button class="btn tiny" id="rpAdd">添加</button>
+    </div>
+    <div class="rowline">
+      <button class="btn tiny primary" id="rpScan">扫描可访问的储存空间</button>
+      <button class="btn tiny ghost" id="rpSaf">唤起系统选择器</button>
+    </div>
+  </div>
+  <div class="foot"><button class="btn ghost" id="rpClose">关闭</button></div>
+</div></div>
 <div id="toast"></div>
 <input type="file" id="filePick" multiple style="display:none"/>
 
@@ -180,8 +209,13 @@ function iconOf(name,isDir){if(isDir)return'📁';const e=(name.split('.').pop()
  if(['html','htm'].includes(e))return'🌐';if(['js','ts','py','java','sh'].includes(e))return'📜';
  if(['json','yaml','yml','xml'].includes(e))return'📋';if(['txt','md','log'].includes(e))return'📝';
  if(['doc','docx','xls','xlsx','ppt','pptx'].includes(e))return'📄';return'📄';}
-async function apiGet(p){const r=await fetch(API+p);const d=await r.json().catch(()=>({}));return{ok:r.ok,data:d};}
-async function apiPost(p,body){const r=await fetch(API+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json().catch(()=>({}));return{ok:r.ok,data:d};}
+let rootPath='', rootWritable=true, rootList=[], serverUid=-1, serverIsRoot=false;
+function withRoot(p){
+  const sep=p.includes('?')?'&':'?';
+  return p+sep+'root='+encodeURIComponent(rootPath||'');
+}
+async function apiGet(p){const r=await fetch(API+withRoot(p));const d=await r.json().catch(()=>({}));return{ok:r.ok,data:d};}
+async function apiPost(p,body){const b=Object.assign({},body||{},{root:rootPath||''});const r=await fetch(API+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const d=await r.json().catch(()=>({}));return{ok:r.ok,data:d};}
 
 function modal(title,val,ta){return new Promise(res=>{
  mResolve=res;$('#mTitle').textContent=title;$('#modal').classList.add('on');
@@ -252,6 +286,7 @@ async function loadDir(rel){
   const arr=data.items||[];
   if(!arr.length&&current!==''){toast('目录为空');}
   items=arr;sel=new Set();sortItems();renderCrumbs();renderList();updateSelBar();
+  if(typeof data.writable==='boolean'){rootWritable=data.writable;applyWritable();}
   $('#dirBadge').textContent='/'+current;
   $('#inpPath').value='/'+current;
   if(typeof termPsUpdate==='function')termPsUpdate();
@@ -321,7 +356,7 @@ function menuFor(p,isDir){
 }
 $('#actMenu').addEventListener('click',e=>{if(e.target.id==='actMenu')closeMenu();});
 
-function downloadFile(rel){const a=document.createElement('a');a.href=API+'/api/file?rel='+encodeURIComponent(rel);a.download=rel.split('/').pop();document.body.appendChild(a);a.click();a.remove();toast('开始下载',true);}
+function downloadFile(rel){const a=document.createElement('a');a.href=API+'/api/file?rel='+encodeURIComponent(rel)+'&root='+encodeURIComponent(rootPath||'');a.download=rel.split('/').pop();document.body.appendChild(a);a.click();a.remove();toast('开始下载',true);}
 async function openFile(rel){
  const name=rel.split('/').pop().toLowerCase();
  const txt=['txt','md','log','json','js','css','html','htm','py','sh','xml','yml','yaml','ini','conf','csv'].some(e=>name.endsWith('.'+e));
@@ -400,7 +435,7 @@ $('#selZipDown').onclick=()=>{
  const rels=[...sel];
  const nm=rels.length===1?rels[0].split('/').pop()+'.zip':'archive.zip';
  const a=document.createElement('a');
- a.href=API+'/api/zipdown?rels='+encodeURIComponent(rels.join(String.fromCharCode(10)))+'&name='+encodeURIComponent(nm);
+ a.href=API+'/api/zipdown?rels='+encodeURIComponent(rels.join(String.fromCharCode(10)))+'&name='+encodeURIComponent(nm)+'&root='+encodeURIComponent(rootPath||'');
  document.body.appendChild(a);a.click();a.remove();
  toast('开始打包下载',true);
 };
@@ -457,13 +492,138 @@ $('#termClear').onclick=()=>{$('#termOut').innerHTML='';};
 termPrint('<span class="c">Nobody 终端 · 在设备本机(Ubuntu)执行命令</span>');
 termPrint('<span class="c">↑/↓ 历史 · Ctrl+L 清屏 · clear 清屏 · 默认跟随当前浏览目录</span>');
 termPsUpdate();
-
 (async()=>{
  const{ok,data}=await apiGet('/api/info');
- $('#rootBadge').textContent='root '+(data.root||'?');
+ serverUid = (data&&typeof data.uid==='number')?data.uid:-1;
+ serverIsRoot = !!(data&&data.isRoot);
  if(!ok)toast('服务信息读取失败',false);
- await loadDir('');
+await loadDir('');
+applyWritable();
 })();
+
+function applyWritable(){
+  const w=rootWritable;
+  const who=serverIsRoot?'root':(serverUid>=0?('uid '+serverUid):'');
+  $('#rootBadge').className='badge '+(w?'rw':'ro');
+  $('#rootBadge').textContent=(w?'可写':'只读')+(who?(' · '+who):'');
+  $('#rootBadge').title=(serverIsRoot?'后端以 root 运行，可访问根目录等受限路径':'后端非 root，仅能访问授权目录（无权限时自动只读）');
+  $('#roTip').style.display=w?'none':'block';
+  ['#btnMkdir','#btnNewfile','#btnUpload','#btnZip','#btnPaste','#selDel','#selZip'].forEach(s=>{
+    const el=$(s); if(el) el.disabled=!w;
+  });
+}
+function renderRootSel(){
+  const s=$('#rootSel');s.innerHTML='';
+  rootList.forEach(r=>{
+    const o=document.createElement('option');
+    o.value=r.path;
+    o.textContent=(r.label||r.path)+(r.writable===false?'（只读）':'');
+    s.appendChild(o);
+  });
+  s.value=rootPath;
+}
+async function loadRoots(pickDefault){
+  const{ok,data}=await apiGet('/api/roots');
+  if(!ok){toast('读取储存空间失败',false);return;}
+  rootList=data.roots||[];
+  const def=data.default||'';
+  if(pickDefault||!rootPath){
+    const match=rootList.find(r=>r.path===rootPath);
+    rootPath=match?rootPath:def;
+  }
+  const cur=rootList.find(r=>r.path===rootPath);
+  if(cur&&typeof cur.writable==='boolean')rootWritable=cur.writable;
+  renderRootSel();applyWritable();
+}
+$('#rootSel').onchange=async e=>{
+  rootPath=e.target.value;
+  const cur=rootList.find(r=>r.path===rootPath)||{};
+  rootWritable=cur.writable!==false;
+  applyWritable();
+  current='';
+  await loadDir('');
+  toast('已切换到 '+(cur.label||rootPath),true);
+};
+function rpSet(msg,ok){const el=$('#rpStatus');el.textContent=msg;el.className='badge '+(ok===false?'ro':'rw');}
+function rpRender(list){
+  const box=$('#rpList');box.innerHTML='';
+  if(!list.length){box.innerHTML='<div class="item">暂无储存空间</div>';return;}
+  list.forEach(r=>{
+    const row=document.createElement('div');row.className='item';
+    const info=document.createElement('div');
+    info.innerHTML='<b>'+((r.label||r.path))+'</b><br><span style="opacity:.7">'+r.path+'</span>';
+    const st=document.createElement('span');st.className='badge '+(r.writable===false?'ro':'rw');
+    st.textContent=r.writable===false?'只读':'可写';
+    const bd=document.createElement('div');
+    bd.appendChild(st);
+    if(r.path!==(window.__defRoot||'')&&r.path!==rootPath){
+      const rm=document.createElement('button');rm.className='btn tiny ghost';rm.textContent='移除';
+      rm.onclick=async()=>{
+        const{ok,data}=await apiGet('/api/roots/remove?path='+encodeURIComponent(r.path));
+        rpSet(data.message||(ok?'已移除':'失败'),ok);
+        if(ok){await loadRoots(false);rpRender(rootList);}
+      };
+      bd.appendChild(rm);
+    }
+    row.appendChild(info);row.appendChild(bd);box.appendChild(row);
+  });
+}
+async function openRootPanel(){
+  $('#rootPanel').classList.add('on');
+  rpSet('加载中…');
+  const{ok,data}=await apiGet('/api/roots');
+  if(!ok){rpSet('读取失败',false);return;}
+  rootList=data.roots||[];window.__defRoot=data.default||'';
+  rpRender(rootList);rpSet('就绪');
+}
+$('#btnAddRoot').onclick=openRootPanel;
+$('#rpClose').onclick=()=>$('#rootPanel').classList.remove('on');
+$('#rpAdd').onclick=async()=>{
+  const p=($('#rpPath').value||'').trim();
+  if(!p)return toast('请输入路径',false);
+  rpSet('添加中…');
+  const{ok,data}=await apiGet('/api/roots/add?path='+encodeURIComponent(p));
+  rpSet(data.message||(ok?'已添加':'失败'),ok);
+  if(ok){$('#rpPath').value='';await loadRoots(false);rpRender(rootList);}
+};
+$('#rpScan').onclick=async()=>{
+  rpSet('扫描中…');
+  const{ok,data}=await apiGet('/api/scan_storage');
+  if(!ok){rpSet('扫描失败',false);return;}
+  const found=data.found||[];
+  if(!found.length){rpSet('未发现可添加的储存空间',false);return;}
+  const box=$('#rpList');box.innerHTML='';
+  found.forEach(v=>{
+    const row=document.createElement('div');row.className='item';
+    const info=document.createElement('div');
+    info.innerHTML='<b>'+(v.label||v.path)+'</b><br><span style="opacity:.7">'+v.path+'</span>';
+    const bd=document.createElement('div');
+    const st=document.createElement('span');st.className='badge '+(v.writable===false?'ro':'rw');
+    st.textContent=v.writable===false?'只读':'可写';bd.appendChild(st);
+    const add=document.createElement('button');add.className='btn tiny primary';add.textContent='添加';
+    add.onclick=async()=>{
+      const{ok:d2,data:d}=await apiGet('/api/roots/add?path='+encodeURIComponent(v.path));
+      rpSet(d.message||(d2?'已添加':'失败'),d2);
+      if(d2){await loadRoots(false);rpRender(rootList);}
+    };
+    bd.appendChild(add);
+    row.appendChild(info);row.appendChild(bd);box.appendChild(row);
+  });
+  rpSet('发现 '+found.length+' 个，点击添加');
+};
+$('#rpSaf').onclick=async()=>{
+  rpSet('正在唤起…');
+  const{ok,data}=await apiGet('/api/saf_picker');
+  rpSet(data.message||(ok?'已唤起':'失败'),ok);
+  toast(data.message||'',ok);
+  if(ok)setTimeout(async()=>{
+    await loadRoots(false);
+    if(data.grants&&data.grants.length)rpRender(data.grants);
+  },1200);
+};
+(async()=>{await loadRoots(true);applyWritable();})();
+
+
 </script>
 </body>
 </html>

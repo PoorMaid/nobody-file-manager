@@ -293,7 +293,19 @@ do_start() {
     pause_any
     return 1
   fi
-  SHHTML_PORT="$PORT" nohup "$PY" "$APP" >"$LOG" 2>&1 &
+  SU_BIN=""
+  for s in su /system/bin/su /system/xbin/su /sbin/su; do
+    if command -v "$s" >/dev/null 2>&1 || [ -x "$s" ]; then
+      if "$s" -c "id" >/dev/null 2>&1; then SU_BIN="$s"; break; fi
+    fi
+  done
+  if [ -n "$SU_BIN" ]; then
+    echo "        Root：已获取 ($SU_BIN)，后端以 root 运行"
+    SHHTML_PORT="$PORT" SHHTML_ROOT="${SHHTML_ROOT:-/}" nohup "$SU_BIN" -c "SHHTML_PORT=$PORT SHHTML_ROOT=${SHHTML_ROOT:-/} \"$PY\" \"$APP\"" >"$LOG" 2>&1 &
+  else
+    echo "        Root：未获取，后端以当前用户运行（根目录受限）"
+    SHHTML_PORT="$PORT" nohup "$PY" "$APP" >"$LOG" 2>&1 &
+  fi
   SRVPID=$!
   echo "$SRVPID" > "$PIDF"
   sleep 1

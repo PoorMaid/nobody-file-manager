@@ -4,3 +4,4 @@ __pycache__/
 .backup/
 clip/
 server.log
+logs/

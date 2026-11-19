@@ -18,7 +18,17 @@ BASE_DIR = Path(__file__).resolve().parent
 APP_ROOT = BASE_DIR.parent
 PANEL_HTML = APP_ROOT / "web" / "index.html"
 PORT = int(os.environ.get("SHHTML_PORT", "9178"))
+VERSION = "2.0.0"
 HOST = "0.0.0.0"
+
+def _cur_uid():
+    try:
+        return os.geteuid()
+    except Exception:
+        try:
+            return os.getuid()
+        except Exception:
+            return -1
 
 def choose_root():
     env = os.environ.get("SHHTML_ROOT")
@@ -38,6 +48,166 @@ def choose_root():
     return Path.cwd()
 
 ROOT = str(choose_root())
+
+ROOTS_FILE = APP_ROOT / "logs" / "roots.json"
+DEFAULT_ROOT = ROOT
+_EXTRA_ROOTS = []
+
+
+def _load_extra_roots():
+    global _EXTRA_ROOTS
+    _EXTRA_ROOTS = []
+    try:
+        raw = ROOTS_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            for item in data:
+                p = str(item or "").strip()
+                if p and p not in _EXTRA_ROOTS:
+                    _EXTRA_ROOTS.append(p)
+    except Exception:
+        _EXTRA_ROOTS = []
+    return _EXTRA_ROOTS
+
+
+def _save_extra_roots():
+    try:
+        ROOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ROOTS_FILE.write_text(json.dumps(_EXTRA_ROOTS, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _probe_writable(path):
+    p = Path(path)
+    try:
+        if not p.is_dir():
+            return False
+        probe = p / (".shhtml_probe_%d" % int(time.time() * 1000))
+        probe.write_bytes(b"x")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def list_roots():
+    _load_extra_roots()
+    seen = []
+    out = []
+    candidates = [DEFAULT_ROOT] + [str(x) for x in _EXTRA_ROOTS]
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        p = Path(c)
+        try:
+            if not p.is_dir():
+                continue
+        except OSError:
+            continue
+        seen.append(c)
+        try:
+            label = p.name or str(p)
+        except Exception:
+            label = c
+        if c == "/sdcard" or c == "/storage/emulated/0":
+            label = "内部存储"
+        out.append({
+            "path": c,
+            "label": label,
+            "writable": _probe_writable(c),
+            "isDefault": c == DEFAULT_ROOT,
+        })
+    return out
+
+
+def resolve_root(req_root):
+    want = str(req_root or "").strip()
+    if not want:
+        return DEFAULT_ROOT
+    for r in list_roots():
+        if r["path"] == want:
+            return want
+    return DEFAULT_ROOT
+
+
+SAF_GRANTS_FILE = APP_ROOT / "logs" / "saf_grants.json"
+
+
+def read_saf_grants():
+    try:
+        raw = SAF_GRANTS_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def open_saf_picker():
+    cmds = [
+        ["am", "start", "-a", "android.intent.action.OPEN_DOCUMENT_TREE"],
+    ]
+    for c in cmds:
+        try:
+            r = subprocess.run(c, capture_output=True, timeout=12)
+            out = (r.stdout or b"").decode("utf-8", "replace")
+            err = (r.stderr or b"").decode("utf-8", "replace")
+            if "Starting:" in out or r.returncode == 0:
+                return True, "已唤起系统目录选择器，请在手机上选择要授权的目录"
+            if "SecurityException" in err or "Permission Denial" in err:
+                return False, "系统拒绝拉起选择器（缺少跨用户权限），请改用“扫描储存空间”"
+        except Exception as e:
+            return False, "唤起失败：%s" % e
+    return False, "系统未响应，请改用“扫描储存空间”"
+
+
+def add_extra_root(path):
+    _load_extra_roots()
+    p = str(path or "").strip()
+    if not p:
+        return False, "路径为空"
+    if not Path(p).is_dir():
+        return False, "目录不存在或不可访问"
+    if p in _EXTRA_ROOTS or p == DEFAULT_ROOT:
+        return True, "已存在"
+    _EXTRA_ROOTS.append(p)
+    if not _save_extra_roots():
+        return False, "保存失败"
+    return True, "已添加"
+
+
+def remove_extra_root(path):
+    _load_extra_roots()
+    p = str(path or "").strip()
+    if p in _EXTRA_ROOTS:
+        _EXTRA_ROOTS.remove(p)
+        _save_extra_roots()
+        return True, "已移除"
+    return False, "不在列表中"
+
+
+def scan_storage_volumes():
+    found = []
+    base = Path("/storage")
+    try:
+        entries = list(base.iterdir())
+    except Exception:
+        return found
+    for e in entries:
+        name = e.name
+        if name in ("emulated", "self", "enc_emulated"):
+            continue
+        try:
+            if not e.is_dir():
+                continue
+            list(e.iterdir())
+        except Exception:
+            continue
+        found.append(str(e))
+    return found
 
 def safe_join(root, rel):
     rel = "" if rel is None else unquote(str(rel))
@@ -122,18 +292,57 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/info":
             self._send_json({
                 "root": ROOT,
+                "default": DEFAULT_ROOT,
+                "roots": list_roots(),
                 "port": PORT,
+                "version": VERSION,
+                "uid": _cur_uid(),
+                "isRoot": _cur_uid() == 0,
             })
             return
-
         if path == "/api/stop_server":
             self._send_json({"ok": True, "message": "stopping"})
             os.kill(os.getpid(), signal.SIGTERM)
             return
+
+        if path == "/api/roots":
+            self._send_json({"ok": True, "roots": list_roots(), "default": DEFAULT_ROOT})
+            return
+
+        if path == "/api/scan_storage":
+            vols = scan_storage_volumes()
+            known = [r["path"] for r in list_roots()]
+            items = []
+            for v in vols:
+                if v in known:
+                    continue
+                items.append({"path": v, "label": Path(v).name, "writable": _probe_writable(v)})
+            self._send_json({"ok": True, "found": items})
+            return
+
+        if path == "/api/saf_picker":
+            opened, msg = open_saf_picker()
+            grants = read_saf_grants()
+            self._send_json({"ok": opened, "message": msg, "grants": grants})
+            return
+
+        if path == "/api/saf_grants":
+            self._send_json({"ok": True, "grants": read_saf_grants()})
+            return
+        if path == "/api/roots/add":
+            ok, msg = add_extra_root(qs.get("path", [""])[0])
+            self._send_json({"ok": ok, "message": msg, "roots": list_roots(), "default": DEFAULT_ROOT})
+            return
+        if path == "/api/roots/remove":
+            ok, msg = remove_extra_root(qs.get("path", [""])[0])
+            self._send_json({"ok": ok, "message": msg, "roots": list_roots(), "default": DEFAULT_ROOT})
+            return
+
             
         if path == "/api/list":
             rel = qs.get("rel", [""])[0]
-            target, ok = safe_join(ROOT, rel)
+            root = resolve_root(qs.get("root", [""])[0])
+            target, ok = safe_join(root, rel)
             if not ok or target is None:
                 self._send_error(400, "invalid path")
                 return
@@ -161,12 +370,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_error(500, str(e))
                 return
                 
-            self._send_json({"root": ROOT, "rel": rel, "items": items})
+            self._send_json({"root": root, "rel": rel, "items": items, "writable": _probe_writable(root)})
             return
             
         if path == "/api/text":
             rel = qs.get("rel", [""])[0]
-            target, ok = safe_join(ROOT, rel)
+            root = resolve_root(qs.get("root", [""])[0])
+            target, ok = safe_join(root, rel)
             if not ok or target is None:
                 self._send_error(400, "invalid path")
                 return
@@ -182,12 +392,13 @@ class Handler(BaseHTTPRequestHandler):
             
         if path == "/api/zipdown":
             rels = qs.get("rels", [""])[0]
+            root = resolve_root(qs.get("root", [""])[0])
             name = qs.get("name", ["archive.zip"])[0] or "archive.zip"
             if not name.endswith(".zip"):
                 name += ".zip"
             targets = []
             for r in [x for x in rels.split(chr(10)) if x.strip()]:
-                tp, ok_t = safe_join(ROOT, r)
+                tp, ok_t = safe_join(root, r)
                 if ok_t and tp is not None and tp.exists():
                     targets.append(tp)
             if not targets:
@@ -218,7 +429,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/file":
             rel = qs.get("rel", [""])[0]
-            target, ok = safe_join(ROOT, rel)
+            root = resolve_root(qs.get("root", [""])[0])
+            target, ok = safe_join(root, rel)
             if not ok or target is None:
                 self._send_error(400, "invalid path")
                 return
@@ -251,10 +463,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/op":
             rel = data.get("rel", "")
             act = data.get("act", "")
+            root = resolve_root(data.get("root", ""))
+            if not _probe_writable(root) and act in ("mkdir", "newfile", "rename", "remove", "save", "copy_multi", "copy", "move", "unzip", "zip"):
+                self._send_error(403, "该储存空间为只读，无法写入")
+                return
             
             if act == "mkdir":
                 name = data.get("name", "")
-                target, ok = safe_join(ROOT, rel)
+                target, ok = safe_join(root, rel)
                 if not ok or not name or "/" in name:
                     self._send_error(400, "invalid input")
                     return
@@ -270,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
                     
             elif act == "newfile":
                 name = data.get("name", "")
-                target, ok = safe_join(ROOT, rel)
+                target, ok = safe_join(root, rel)
                 if not ok or not name or "/" in name:
                     self._send_error(400, "invalid input")
                     return
@@ -286,7 +502,7 @@ class Handler(BaseHTTPRequestHandler):
                     
             elif act == "rename":
                 newname = data.get("name", "")
-                target, ok = safe_join(ROOT, rel)
+                target, ok = safe_join(root, rel)
                 if not ok or not newname:
                     self._send_error(400, "invalid input")
                     return
@@ -301,8 +517,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_error(500, str(e))
                     
             elif act == "remove":
-                target, ok = safe_join(ROOT, rel)
-                if not ok or target == Path(ROOT) or not target.exists():
+                target, ok = safe_join(root, rel)
+                if not ok or target == Path(root) or not target.exists():
                     self._send_error(400, "cannot remove")
                     return
                 try:
@@ -316,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
                     
             elif act == "save":
                 text = data.get("text", "")
-                target, ok = safe_join(ROOT, rel)
+                target, ok = safe_join(root, rel)
                 if not ok:
                     self._send_error(400, "invalid path")
                     return
@@ -329,13 +545,13 @@ class Handler(BaseHTTPRequestHandler):
             elif act == "copy_multi":
                 rels = data.get("rels", []) or []
                 dst = data.get("dst", "")
-                dst_dir, ok2 = safe_join(ROOT, dst if dst else ".")
+                dst_dir, ok2 = safe_join(root, dst if dst else ".")
                 if not ok2 or dst_dir is None or not dst_dir.is_dir():
                     self._send_error(400, "invalid destination")
                     return
                 done, failed = 0, []
                 for rel_item in rels:
-                    src, ok_s = safe_join(ROOT, rel_item)
+                    src, ok_s = safe_join(root, rel_item)
                     if not ok_s or src is None or not src.exists():
                         failed.append(rel_item)
                         continue
@@ -360,8 +576,8 @@ class Handler(BaseHTTPRequestHandler):
 
             elif act == "copy" or act == "move":
                 dst = data.get("dst", "")
-                target, ok = safe_join(ROOT, rel)
-                dst_dir, ok2 = safe_join(ROOT, dst)
+                target, ok = safe_join(root, rel)
+                dst_dir, ok2 = safe_join(root, dst)
                 if not ok or not ok2:
                     self._send_error(400, "invalid paths")
                     return
@@ -382,7 +598,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_error(500, str(e))
                     
             elif act == "unzip":
-                target, ok = safe_join(ROOT, rel)
+                target, ok = safe_join(root, rel)
                 if not ok or target is None or not target.is_file():
                     self._send_error(400, "not a file")
                     return
@@ -414,7 +630,7 @@ class Handler(BaseHTTPRequestHandler):
             elif act == "zip":
                 rels = data.get("rels", [])
                 dst_rel = data.get("dst", "archive.zip")
-                out_dir, ok_out = safe_join(ROOT, os.path.dirname(dst_rel) or ".")
+                out_dir, ok_out = safe_join(root, os.path.dirname(dst_rel) or ".")
                 out_name = os.path.basename(dst_rel) or "archive.zip"
                 if not ok_out or not out_name:
                     self._send_error(400, "invalid zip path")
@@ -426,14 +642,14 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
                         for rel_item in rels:
-                            item, ok_item = safe_join(ROOT, rel_item)
+                            item, ok_item = safe_join(root, rel_item)
                             if not ok_item or item is None:
                                 continue
                             if item.is_dir():
                                 for root_dir, _, files in os.walk(item):
                                     for fname in files:
                                         fp = Path(root_dir) / fname
-                                        zf.write(fp, os.path.relpath(fp, item.parent) if item != Path(ROOT) else os.path.relpath(fp, item))
+                                        zf.write(fp, os.path.relpath(fp, item.parent) if item != Path(root) else os.path.relpath(fp, item))
                             else:
                                 zf.write(item, item.name)
                     self._send_json({"ok": True, "result": str(out_path)})
@@ -445,7 +661,8 @@ class Handler(BaseHTTPRequestHandler):
                 
         elif path == "/api/exec":
             cmd = data.get("cmd", "")
-            cwd = data.get("cwd", "") or ROOT
+            root = resolve_root(data.get("root", ""))
+            cwd = data.get("cwd", "") or root
             timeout = data.get("timeout", 30)
             if not cmd.strip():
                 self._send_error(400, "empty command")
@@ -454,9 +671,9 @@ class Handler(BaseHTTPRequestHandler):
                 timeout = max(1, min(int(timeout), 300))
             except Exception:
                 timeout = 30
-            real_cwd, ok_cwd = safe_join(ROOT, cwd)
+            real_cwd, ok_cwd = safe_join(root, cwd)
             if not ok_cwd or real_cwd is None or not real_cwd.is_dir():
-                real_cwd = Path(ROOT)
+                real_cwd = Path(root)
             try:
                 proc = subprocess.run(
                     ["bash", "-lc", cmd],
@@ -488,7 +705,11 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/upload":
             rel_dir = data.get("rel", "")
-            target, ok = safe_join(ROOT, rel_dir)
+            root = resolve_root(data.get("root", ""))
+            if not _probe_writable(root):
+                self._send_error(403, "该储存空间为只读，无法写入")
+                return
+            target, ok = safe_join(root, rel_dir)
             if not ok:
                 self._send_error(400, "invalid path")
                 return
