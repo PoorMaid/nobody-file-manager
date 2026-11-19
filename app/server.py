@@ -7,12 +7,15 @@ import signal
 import time
 import sys
 import zipfile
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 from pathlib import Path
 import base64
 import shutil
 import subprocess
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import priv
+import term
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ROOT = BASE_DIR.parent
@@ -22,6 +25,13 @@ VERSION = "2.0.0"
 HOST = "0.0.0.0"
 
 def _cur_uid():
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
     try:
         return os.geteuid()
     except Exception:
@@ -37,33 +47,33 @@ def _probe_priv():
         names = os.listdir("/data/data")
     except Exception:
         return False
-    readable_uids = set()
-    for n in names:
+    readable = 0
+    for n in names[:80]:
         p = "/data/data/" + n
         try:
-            st = os.stat(p)
-        except Exception:
-            continue
-        try:
+            os.stat(p)
             os.listdir(p)
         except Exception:
             continue
-        if st.st_uid != 0:
-            readable_uids.add(st.st_uid)
-    return len(readable_uids) >= 2
+        readable += 1
+        if readable >= 3:
+            return True
+    return False
 
 def _probe_su():
-    for cmd in ("/system/bin/su", "/system/xbin/su"):
+    for cmd in ("/system/bin/su", "/system/xbin/su", "/sbin/su", "/debug_ramdisk/su", "/data/adb/ksu/bin/su", "/data/adb/magisk/su"):
         try:
             r = subprocess.run([cmd, "-c", "id"], capture_output=True, timeout=3)
         except Exception:
             continue
         out = (r.stdout or b"") + (r.stderr or b"")
-        if b"uid=0" in out:
+        if b"uid=0" in out and _probe_priv():
             return True
     return False
 
 def detect_real_root():
+    if _cur_uid() == 0 and _probe_priv():
+        return True
     if _probe_priv():
         return True
     if _probe_su():
@@ -87,7 +97,7 @@ def choose_root():
                 return p
         except OSError:
             pass
-    for root in (Path("/sdcard"), Path("/storage/emulated/0"), Path.home()):
+    for root in (APP_ROOT, Path("/storage/emulated/0/Download/shhtml"), Path("/sdcard"), Path("/storage/emulated/0"), Path.home()):
         try:
             if root.is_dir():
                 return root
@@ -356,6 +366,7 @@ def unzip_into(zip_path, out_dir):
                 shutil.copyfileobj(src, dst)
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def log_message(self, fmt, *args):
         sys.stderr.write("%s\n" % (fmt % args))
 
@@ -411,6 +422,33 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "message": "stopping"})
             os.kill(os.getpid(), signal.SIGTERM)
             return
+        if path == "/api/priv/status":
+            try:
+                self._send_json({"ok": True, **priv.status(), "hint": priv.start_hint()})
+            except Exception as e:
+                self._send_json({"ok": False, "err": str(e)})
+            return
+        if path == "/api/priv/list":
+            target = (qs.get("path") or ["/storage/emulated/0"])[0]
+            r = priv.ls(target)
+            self._send_json(r)
+            return
+        if path == "/api/priv/text":
+            target = (qs.get("path") or [""])[0]
+            if not target:
+                self._send_error(400, "path required")
+                return
+            r = priv.read_text(target)
+            self._send_json(r)
+            return
+        if path == "/api/priv/exec":
+            cmd = (qs.get("cmd") or [""])[0]
+            if not cmd:
+                self._send_error(400, "cmd required")
+                return
+            r = priv.sh(cmd, timeout=30.0)
+            self._send_json(r)
+            return
 
         if path == "/api/roots":
             self._send_json({"ok": True, "roots": list_roots(), "default": DEFAULT_ROOT})
@@ -444,10 +482,16 @@ class Handler(BaseHTTPRequestHandler):
             if not ok or target is None:
                 self._send_error(400, "invalid path")
                 return
-            if not target.is_dir():
-                self._send_error(404, "not a directory")
-                return
-                
+            try:
+                is_dir = target.is_dir()
+            except OSError:
+                is_dir = True
+            if not is_dir:
+                r = priv.sh("[ -d '%s' ] && echo Y || echo N" % str(target).replace("'", "'\\''"))
+                if "Y" not in (r.get("stdout") or ""):
+                    self._send_error(404, "not a directory")
+                    return
+
             items = []
             try:
                 entries = sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
@@ -465,8 +509,26 @@ class Handler(BaseHTTPRequestHandler):
                         "mtime": int(mtime),
                     })
             except OSError as e:
-                self._send_error(500, str(e))
-                return
+                alt = None
+                try:
+                    alt = priv.ls(str(target))
+                except Exception:
+                    alt = None
+                if not alt or not alt.get("ok"):
+                    self._send_error(500, str(e))
+                    return
+                for it in alt.get("items") or []:
+                    name = it.get("name") or ""
+                    if not name or name in (".", ".."):
+                        continue
+                    items.append({
+                        "name": name,
+                        "path": f"{rel.rstrip('/')}/{name}" if rel and rel != "/" else name,
+                        "rel": f"{rel.rstrip('/')}/{name}" if rel and rel != "/" else name,
+                        "isDir": bool(it.get("dir")),
+                        "size": int(it.get("size") or 0),
+                        "mtime": int(it.get("mtime") or 0),
+                    })
                 
             self._send_json({"root": root, "rel": rel, "items": items, "writable": _probe_writable(root)})
             return
@@ -559,6 +621,40 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(body.decode("utf-8")) if body else {}
         except:
             data = {}
+            
+        if path == "/api/priv/write":
+            target = data.get("path", "")
+            text = data.get("text", data.get("content", ""))
+            if not target:
+                self._send_error(400, "path required")
+                return
+            self._send_json(priv.write_text(target, text))
+            return
+        if path == "/api/priv/op":
+            act = data.get("act", data.get("op", ""))
+            target = data.get("path", "")
+            to = data.get("target", data.get("to", ""))
+            if act == "newfolder":
+                act = "mkdir"
+            elif act == "newfile":
+                act = "newfile"
+            if not target:
+                self._send_error(400, "path required")
+                return
+            self._send_json(priv.op(act, target, to))
+            return
+        if path == "/api/priv/restart":
+            q = str(priv.PRIV_Q)
+            s = str(priv.PRIVD)
+            try:
+                pid = int(priv.PRIV_PID.read_text(encoding="utf-8").strip())
+                priv.sh("kill -9 %d 2>/dev/null; echo KILLED" % pid, timeout=8.0)
+            except Exception:
+                pass
+            priv.sh("(setsid sh %s %s >/dev/null 2>&1 </dev/null &) ; sleep 1; echo STARTED" % (priv._esc(s), priv._esc(q)), timeout=12.0)
+            time.sleep(0.6)
+            self._send_json({"ok": True, **priv.status()})
+            return
             
         if path == "/api/op":
             rel = data.get("rel", "")
@@ -774,6 +870,22 @@ class Handler(BaseHTTPRequestHandler):
             real_cwd, ok_cwd = safe_join(root, cwd)
             if not ok_cwd or real_cwd is None or not real_cwd.is_dir():
                 real_cwd = Path(root)
+
+            want_shell = data.get("shell", True)
+            if want_shell:
+                full = "cd " + priv._esc(str(real_cwd)) + " 2>/dev/null || true; " + cmd
+                r = priv.sh(full)
+                self._send_json({
+                    "ok": bool(r.get("ok")),
+                    "code": r.get("code", 0 if r.get("ok") else -1),
+                    "stdout": (r.get("out") or "")[-200000:],
+                    "stderr": (r.get("err") or "")[-20000:],
+                    "cwd": str(real_cwd),
+                    "mode": r.get("mode") or priv._best_mode(),
+                    "uid": r.get("uid"),
+                })
+                return
+
             try:
                 proc = subprocess.run(
                     ["bash", "-lc", cmd],
@@ -789,6 +901,7 @@ class Handler(BaseHTTPRequestHandler):
                     "stdout": out[-200000:],
                     "stderr": err[-200000:],
                     "cwd": str(real_cwd),
+                    "mode": "proot",
                 })
             except subprocess.TimeoutExpired as e:
                 o = (e.stdout or b"").decode("utf-8", "replace") if e.stdout else ""
@@ -802,6 +915,67 @@ class Handler(BaseHTTPRequestHandler):
                 })
             except Exception as e:
                 self._send_error(500, str(e))
+
+        elif path == "/api/term/open":
+            root = resolve_root(data.get("root", ""))
+            cwd = data.get("cwd", "") or root
+            real_cwd, ok_cwd = safe_join(root, cwd)
+            if not ok_cwd or real_cwd is None or not real_cwd.is_dir():
+                real_cwd = Path(root)
+            mode = priv._best_mode()
+            try:
+                if data.get("shell"):
+                    s = term.open_shell(str(real_cwd), mode)
+                else:
+                    rel = data.get("script", "")
+                    sp, okp = safe_join(root, rel)
+                    if not okp or sp is None or not sp.is_file():
+                        self._send_error(400, "script not found")
+                        return
+                    s = term.open_script(str(sp), str(real_cwd), mode)
+                info = s.info()
+                info["mode"] = mode
+                self._send_json(info)
+            except Exception as e:
+                self._send_error(500, str(e))
+            return
+
+        elif path == "/api/term/read":
+            sid = data.get("id", "")
+            s = term.get(sid)
+            if not s:
+                self._send_error(404, "session not found")
+                return
+            out = s.drain(reset=bool(data.get("reset", True)))
+            info = s.info()
+            info["mode"] = s.mode
+            info["out"] = out
+            self._send_json(info)
+            return
+
+        elif path == "/api/term/write":
+            sid = data.get("id", "")
+            s = term.get(sid)
+            if not s:
+                self._send_error(404, "session not found")
+                return
+            ok = s.write(data.get("data", ""))
+            out = s.drain(reset=True)
+            info = s.info()
+            info["mode"] = s.mode
+            info["wrote"] = ok
+            info["out"] = out
+            self._send_json(info)
+            return
+
+        elif path == "/api/term/close":
+            sid = data.get("id", "")
+            self._send_json({"ok": term.close(sid)})
+            return
+
+        elif path == "/api/term/gc":
+            self._send_json({"ok": True, "closed": term.gc()})
+            return
 
         elif path == "/api/upload":
             rel_dir = data.get("rel", "")
@@ -835,10 +1009,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_error(self, code, msg):
         self._send_json({"error": msg}, code)
+    def send_error(self, code, message=None, explain=None):
+        try:
+            self._send_error(code, message or "error")
+        except Exception:
+            pass
 
 def main():
     os.chdir(APP_ROOT)
-    server = HTTPServer((HOST, PORT), Handler)
+    ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.daemon_threads = True
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         (APP_ROOT / "logs" / "port.txt").write_text(str(PORT), encoding="utf-8")
     except OSError:
