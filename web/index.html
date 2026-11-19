@@ -184,7 +184,6 @@ main{display:grid;grid-template-columns:1fr 340px;gap:12px;padding:12px;align-it
     </div>
     <div class="rowline">
       <button class="btn tiny primary" id="rpScan">扫描可访问的储存空间</button>
-      <button class="btn tiny ghost" id="rpSaf">唤起系统选择器</button>
     </div>
   </div>
   <div class="foot"><button class="btn ghost" id="rpClose">关闭</button></div>
@@ -495,10 +494,14 @@ termPsUpdate();
 (async()=>{
  const{ok,data}=await apiGet('/api/info');
  serverUid = (data&&typeof data.uid==='number')?data.uid:-1;
- serverIsRoot = !!(data&&data.isRoot);
- if(!ok)toast('服务信息读取失败',false);
-await loadDir('');
-applyWritable();
+  serverIsRoot = !!(data&&data.isRoot);
+  if(!ok)toast('服务信息读取失败',false);
+  else if(!serverIsRoot && data&&data.rootHint && !sessionStorage.getItem('rootHintShown')){
+    sessionStorage.setItem('rootHintShown','1');
+    toast(data.rootHint,false);
+  }
+  await loadDir('');
+  applyWritable();
 })();
 
 function applyWritable(){
@@ -506,7 +509,7 @@ function applyWritable(){
   const who=serverIsRoot?'root':(serverUid>=0?('uid '+serverUid):'');
   $('#rootBadge').className='badge '+(w?'rw':'ro');
   $('#rootBadge').textContent=(w?'可写':'只读')+(who?(' · '+who):'');
-  $('#rootBadge').title=(serverIsRoot?'后端以 root 运行，可访问根目录等受限路径':'后端非 root，仅能访问授权目录（无权限时自动只读）');
+  $('#rootBadge').title=(serverIsRoot?'后端已获得真实 root，可访问全盘路径':'未获得真实 root，仅能访问当前可读目录');
   $('#roTip').style.display=w?'none':'block';
   ['#btnMkdir','#btnNewfile','#btnUpload','#btnZip','#btnPaste','#selDel','#selZip'].forEach(s=>{
     const el=$(s); if(el) el.disabled=!w;
@@ -610,16 +613,6 @@ $('#rpScan').onclick=async()=>{
     row.appendChild(info);row.appendChild(bd);box.appendChild(row);
   });
   rpSet('发现 '+found.length+' 个，点击添加');
-};
-$('#rpSaf').onclick=async()=>{
-  rpSet('正在唤起…');
-  const{ok,data}=await apiGet('/api/saf_picker');
-  rpSet(data.message||(ok?'已唤起':'失败'),ok);
-  toast(data.message||'',ok);
-  if(ok)setTimeout(async()=>{
-    await loadRoots(false);
-    if(data.grants&&data.grants.length)rpRender(data.grants);
-  },1200);
 };
 (async()=>{await loadRoots(true);applyWritable();})();
 
